@@ -247,17 +247,27 @@ if archive_btn:
         st.stop()
 
     # Stap 2: Toon preview
+    source_emoji = "🗄️ archive.ph" if result.source == "archive.ph" else "🌐 direct"
+    tried_str = " → ".join(result.tried) if result.tried else result.source
+
     st.markdown(f"""
     <div class="result-card">
         <h3>{result.title}</h3>
         <div class="meta-line">
             🔗 {url} &nbsp;|&nbsp;
             📄 {len(result.text):,} tekens &nbsp;|&nbsp;
-            HTTP {result.status_code}
+            HTTP {result.status_code} &nbsp;|&nbsp;
+            {source_emoji}
         </div>
         <div class="text-preview">{result.text[:1500]}{"…" if len(result.text) > 1500 else ""}</div>
     </div>
     """, unsafe_allow_html=True)
+
+    if result.source == "archive.ph":
+        st.info(
+            "ℹ️ Directe fetch was geblokkeerd. Tekst opgehaald via **archive.ph** "
+            f"(geprobeerd: {tried_str})."
+        )
 
     # Stap 3: GitHub commit
     with st.spinner("☁️ Archiveren naar GitHub…"):
