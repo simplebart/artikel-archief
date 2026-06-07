@@ -4,7 +4,7 @@ scraper.py — Request & Evasion + Parsing & DOM-Extractie Laag
 Waterval-strategie:
   1. Directe fetch (roterende browser UA's)
   2. 12ft.io proxy fallback
-  3. archive.ph fallback (met retry na 429)
+  3. archive.ph fallback
 
 Fase 2-ready: vervang _fetch_direct door _fetch_with_playwright
               zonder de publieke scrape(url) interface te wijzigen.
@@ -20,7 +20,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 import requests
-from bs4 import BeautifulSoup, Tag, NavigableString
+from bs4 import BeautifulSoup, Tag
 
 logger = logging.getLogger(__name__)
 
@@ -119,10 +119,6 @@ def _fetch_direct(url: str) -> tuple[int, str]:
 
 
 def _fetch_12ft(url: str) -> tuple[int, str]:
-    """
-    12ft.io proxy — stuurt verzoek via hun server die paywall-JS overslaat.
-    Werkt goed voor Nederlandse kranten (NRC, Volkskrant, FD).
-    """
     proxy_url = f"https://12ft.io/proxy?q={url}"
     session = _make_session()
     resp = session.get(proxy_url, timeout=TIMEOUT, allow_redirects=True)
@@ -132,7 +128,6 @@ def _fetch_12ft(url: str) -> tuple[int, str]:
 
 
 def _fetch_archive(url: str) -> tuple[int, str]:
-    """archive.ph/newest/<url> — gearchiveerde snapshot."""
     archive_url = f"https://archive.ph/newest/{url}"
     session = _make_session()
     resp = session.get(archive_url, timeout=TIMEOUT, allow_redirects=True)
@@ -163,20 +158,40 @@ def _fetch_archive(url: str) -> tuple[int, str]:
 # Parsing & DOM-Extractie
 # ---------------------------------------------------------------------------
 
+def _get_tag_attrs(tag: Tag) -> tuple[list, str]:
+    """
+    Lees class en id veilig uit een Tag, ongeacht BS4/Python versie.
+    Retourneert (classes_list, id_string).
+    """
+    try:
+        attrs = tag.attrs if hasattr(tag, "attrs") and tag.attrs else {}
+    except Exception:
+        return [], ""
+
+    classes = attrs.get("class") or []
+    if isinstance(classes, str):
+        classes = [classes]
+
+    tag_id = attrs.get("id") or ""
+    if isinstance(tag_id, list):
+        tag_id = " ".join(tag_id)
+
+    return classes, str(tag_id)
+
+
 def _strip_noise(soup: BeautifulSoup) -> None:
     # Verwijder bekende ruis-tags
-    for tag in soup.find_all(_STRIP_TAGS):
+    for tag in list(soup.find_all(_STRIP_TAGS)):
         tag.decompose()
 
-    # Na decompose() kunnen NavigableString-nodes overblijven zonder .get() —
-    # controleer expliciet op Tag-instantie voor we attributen uitlezen
+    # Verwijder paywall/ad-elementen op class of id
+    # Werkt veilig op alle BS4/Python versies via _get_tag_attrs
     for tag in list(soup.find_all(True)):
         if not isinstance(tag, Tag):
             continue
-        classes = tag.get("class") or []
-        tag_id = tag.get("id") or ""
-        attrs = " ".join(str(v) for v in classes) + " " + str(tag_id)
-        if _PAYWALL_PATTERNS.search(attrs):
+        classes, tag_id = _get_tag_attrs(tag)
+        attr_str = " ".join(str(v) for v in classes) + " " + tag_id
+        if _PAYWALL_PATTERNS.search(attr_str):
             tag.decompose()
 
 
@@ -195,8 +210,10 @@ def _find_article_container(soup: BeautifulSoup) -> Optional[Tag]:
 
 def _extract_title(soup: BeautifulSoup) -> str:
     og = soup.find("meta", property="og:title")
-    if og and isinstance(og, Tag) and og.get("content"):
-        return str(og["content"]).strip()
+    if og and isinstance(og, Tag):
+        content = og.get("content")
+        if content:
+            return str(content).strip()
     h1 = soup.find("h1")
     if h1:
         return h1.get_text(strip=True)
@@ -254,10 +271,6 @@ def _try_fetch(
     url: str,
     tried: list[str],
 ) -> tuple[Optional[tuple[int, str]], Optional[str]]:
-    """
-    Voer fetch_fn(url) uit. Retourneert ((status, html), None) bij succes,
-    of (None, foutmelding) bij mislukking.
-    """
     tried.append(label)
     try:
         result = fetch_fn(url)
@@ -280,17 +293,15 @@ def _try_fetch(
 def scrape(url: str) -> ScrapeResult:
     """
     Waterval-scraper: direct → 12ft.io → archive.ph
-
     Retourneert altijd een ScrapeResult, gooit nooit een exception.
     """
     tried: list[str] = []
     errors: list[str] = []
 
-    # Definieer de waterval: (fetch-functie, label, source-naam)
     waterfall = [
-        (_fetch_direct,  "direct",    "direct"),
-        (_fetch_12ft,    "12ft.io",   "12ft.io"),
-        (_fetch_archive, "archive.ph","archive.ph"),
+        (_fetch_direct,  "direct",     "direct"),
+        (_fetch_12ft,    "12ft.io",    "12ft.io"),
+        (_fetch_archive, "archive.ph", "archive.ph"),
     ]
 
     for fetch_fn, label, source_name in waterfall:
@@ -312,11 +323,9 @@ def scrape(url: str) -> ScrapeResult:
                 status_code=status_code, tried=tried,
             )
 
-        # Pagina geladen maar te weinig tekst — ga door naar volgende
         errors.append(f"{label}: pagina geladen maar te weinig tekst ({len(text)} tekens)")
         logger.info("Te weinig tekst via %s, volgende methode proberen…", label)
 
-    # Alle methodes mislukt
     error_summary = "\n".join(f"• {e}" for e in errors)
     return ScrapeResult(
         success=False, title="", text="", url=url,
