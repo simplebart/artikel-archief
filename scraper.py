@@ -1,16 +1,22 @@
 """
 scraper.py — Request & Evasion + Parsing & DOM-Extractie Laag
 
-Fase 1: requests + BeautifulSoup
+Strategie (waterval):
+  1. Directe fetch met roterende User-Agent strings
+  2. Bij 403/429 → archive.ph fallback
+  3. Bij archive.ph mislukking → duidelijke foutmelding
+
 Fase 2-ready: vervang `_fetch_with_requests` door `_fetch_with_playwright`
-                zonder de publieke `scrape(url)` interface te wijzigen.
+              zonder de publieke `scrape(url)` interface te wijzigen.
 """
 
 from __future__ import annotations
 
 import re
+import time
+import random
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 import requests
@@ -19,40 +25,27 @@ from bs4 import BeautifulSoup, Tag
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Configuratie
+# User-Agent pool — roteert bij elke aanroep
 # ---------------------------------------------------------------------------
 
-# Semantische container-tags (hoog vertrouwen → laag vertrouwen)
-_ARTICLE_TAGS = ["article", "main", "section"]
-
-# CSS-classes die typisch de bulk-tekst bevatten
-_ARTICLE_CLASSES = [
-    "article", "article-body", "article__body", "article-content",
-    "article__content", "post-content", "entry-content", "story-body",
-    "story__body", "content-body", "main-content", "body-text",
-    "paragraph", "field-body",
+_USER_AGENTS = [
+    # Chrome op Windows
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    # Chrome op Mac
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    # Firefox op Windows
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) "
+    "Gecko/20100101 Firefox/125.0",
+    # Safari op Mac
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4_1) AppleWebKit/605.1.15 "
+    "(KHTML, like Gecko) Version/17.4.1 Safari/605.1.15",
+    # Googlebot (SEO-bypass)
+    "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)",
 ]
 
-# DOM-elementen die we altijd verwijderen
-_STRIP_TAGS = [
-    "script", "style", "noscript", "iframe", "nav", "header", "footer",
-    "aside", "figure", "figcaption", "form", "button", "svg", "img",
-    "picture", "video", "audio", "ads", "ad",
-]
-
-# CSS-classes/-id's die op paywall/ad-overlays wijzen
-_PAYWALL_PATTERNS = re.compile(
-    r"paywall|pay-wall|premium|subscriber|subscription|"
-    r"metered|locked|gate|overlay|modal|popup|banner|"
-    r"cookie|consent|gdpr|ad[-_]|advertisement",
-    re.IGNORECASE,
-)
-
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (compatible; Googlebot/2.1; "
-        "+http://www.google.com/bot.html)"
-    ),
+_BASE_HEADERS = {
     "Accept": (
         "text/html,application/xhtml+xml,application/xml;"
         "q=0.9,image/avif,image/webp,*/*;q=0.8"
@@ -66,7 +59,33 @@ HEADERS = {
     "Upgrade-Insecure-Requests": "1",
 }
 
-TIMEOUT = 15  # seconden
+TIMEOUT = 20
+
+# ---------------------------------------------------------------------------
+# Semantische selectors
+# ---------------------------------------------------------------------------
+
+_ARTICLE_TAGS = ["article", "main", "section"]
+
+_ARTICLE_CLASSES = [
+    "article", "article-body", "article__body", "article-content",
+    "article__content", "post-content", "entry-content", "story-body",
+    "story__body", "content-body", "main-content", "body-text",
+    "paragraph", "field-body",
+]
+
+_STRIP_TAGS = [
+    "script", "style", "noscript", "iframe", "nav", "header", "footer",
+    "aside", "figure", "figcaption", "form", "button", "svg", "img",
+    "picture", "video", "audio",
+]
+
+_PAYWALL_PATTERNS = re.compile(
+    r"paywall|pay-wall|premium|subscriber|subscription|"
+    r"metered|locked|gate|overlay|modal|popup|banner|"
+    r"cookie|consent|gdpr|ad[-_]|advertisement",
+    re.IGNORECASE,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -79,42 +98,56 @@ class ScrapeResult:
     title: str
     text: str
     url: str
+    source: str = "direct"          # "direct" | "archive.ph"
     error: Optional[str] = None
     status_code: Optional[int] = None
+    tried: list[str] = field(default_factory=list)  # log van geprobeerde methodes
 
 
 # ---------------------------------------------------------------------------
-# Fase 1 — requests
+# Fetch-laag
 # ---------------------------------------------------------------------------
 
-def _fetch_with_requests(url: str) -> tuple[int, str]:
-    """
-    Haal de raw HTML op via requests.
-    Raises requests.HTTPError bij 4xx/5xx.
-    Retourneert (status_code, html_text).
-    """
+def _make_session(ua: Optional[str] = None) -> requests.Session:
     session = requests.Session()
-    session.headers.update(HEADERS)
+    headers = dict(_BASE_HEADERS)
+    headers["User-Agent"] = ua or random.choice(_USER_AGENTS)
+    session.headers.update(headers)
+    return session
 
-    response = session.get(url, timeout=TIMEOUT, allow_redirects=True)
-    response.raise_for_status()
-    response.encoding = response.apparent_encoding or "utf-8"
-    return response.status_code, response.text
+
+def _fetch_direct(url: str) -> tuple[int, str]:
+    """Directe fetch met willekeurige UA. Raises HTTPError bij 4xx/5xx."""
+    session = _make_session()
+    resp = session.get(url, timeout=TIMEOUT, allow_redirects=True)
+    resp.raise_for_status()
+    resp.encoding = resp.apparent_encoding or "utf-8"
+    return resp.status_code, resp.text
+
+
+def _fetch_archive(url: str) -> tuple[int, str]:
+    """
+    Haal de nieuwste gearchiveerde versie op via archive.ph.
+    archive.ph/newest/<url> redirectt naar de meest recente snapshot.
+    """
+    archive_url = f"https://archive.ph/newest/{url}"
+    session = _make_session()
+    resp = session.get(archive_url, timeout=TIMEOUT, allow_redirects=True)
+    resp.raise_for_status()
+    resp.encoding = resp.apparent_encoding or "utf-8"
+    return resp.status_code, resp.text
 
 
 # ---------------------------------------------------------------------------
-# Fase 2 stub — Playwright (async)
+# Fase 2 stub — Playwright
 # ---------------------------------------------------------------------------
-# Uncomment en implementeer dit blok wanneer je overschakelt naar Fase 2.
-#
 # async def _fetch_with_playwright(url: str) -> tuple[int, str]:
 #     from playwright.async_api import async_playwright
 #     async with async_playwright() as pw:
 #         browser = await pw.chromium.launch(headless=True)
 #         context = await browser.new_context(
-#             user_agent=HEADERS["User-Agent"],
-#             extra_http_headers={k: v for k, v in HEADERS.items()
-#                                  if k != "User-Agent"},
+#             user_agent=random.choice(_USER_AGENTS),
+#             extra_http_headers={k: v for k, v in _BASE_HEADERS.items()},
 #         )
 #         page = await context.new_page()
 #         response = await page.goto(url, wait_until="networkidle", timeout=30_000)
@@ -128,47 +161,29 @@ def _fetch_with_requests(url: str) -> tuple[int, str]:
 # ---------------------------------------------------------------------------
 
 def _strip_noise(soup: BeautifulSoup) -> None:
-    """Verwijder scripts, stijlen, navs, ads, paywall-overlays, etc."""
-    # Verwijder bekende ruis-tags
     for tag in soup.find_all(_STRIP_TAGS):
         tag.decompose()
-
-    # Verwijder elementen met paywall/ad-gerelateerde class of id
     for tag in soup.find_all(True):
         attrs = " ".join(
-            str(v) for v in (
-                tag.get("class", []) + [tag.get("id", "")]
-            )
+            str(v) for v in (tag.get("class", []) + [tag.get("id", "")])
         )
         if _PAYWALL_PATTERNS.search(attrs):
             tag.decompose()
 
 
 def _find_article_container(soup: BeautifulSoup) -> Optional[Tag]:
-    """
-    Zoek de meest waarschijnlijke tekst-container via:
-    1. Semantische tags (<article>, <main>, <section>)
-    2. CSS-classes die op artikel-body wijzen
-    3. Fallback: <body>
-    """
-    # 1. Directe semantische tags
     for tag_name in _ARTICLE_TAGS:
         tag = soup.find(tag_name)
         if tag:
             return tag
-
-    # 2. CSS-classes
     for cls in _ARTICLE_CLASSES:
         tag = soup.find(class_=re.compile(rf"\b{cls}\b", re.IGNORECASE))
         if tag:
             return tag
-
-    # 3. Fallback
     return soup.find("body")
 
 
 def _extract_title(soup: BeautifulSoup) -> str:
-    """Haal de paginatitel op (og:title → <h1> → <title>)."""
     og = soup.find("meta", property="og:title")
     if og and og.get("content"):
         return og["content"].strip()
@@ -180,12 +195,7 @@ def _extract_title(soup: BeautifulSoup) -> str:
 
 
 def _to_markdown(container: Tag) -> str:
-    """
-    Converteer de container naar leesbare platte tekst met Markdown-opmaak
-    voor koppen en alinea's.
-    """
     lines: list[str] = []
-
     for elem in container.find_all(
         ["h1", "h2", "h3", "h4", "h5", "h6", "p", "li", "blockquote"],
         recursive=True,
@@ -193,7 +203,6 @@ def _to_markdown(container: Tag) -> str:
         text = elem.get_text(separator=" ", strip=True)
         if not text:
             continue
-
         tag = elem.name
         if tag == "h1":
             lines.append(f"# {text}")
@@ -209,12 +218,19 @@ def _to_markdown(container: Tag) -> str:
             lines.append(f"- {text}")
         else:
             lines.append(text)
+        lines.append("")
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip()
 
-        lines.append("")  # lege regel na elk element
 
-    # Verwijder opeenvolgende lege regels
-    result = re.sub(r"\n{3,}", "\n\n", "\n".join(lines))
-    return result.strip()
+def _parse_html(html: str) -> tuple[str, str]:
+    """Parse HTML → (title, markdown_text). Retourneert ("", "") bij mislukking."""
+    soup = BeautifulSoup(html, "html.parser")
+    title = _extract_title(soup)
+    _strip_noise(soup)
+    container = _find_article_container(soup)
+    if not container:
+        return title, ""
+    return title, _to_markdown(container)
 
 
 # ---------------------------------------------------------------------------
@@ -223,60 +239,101 @@ def _to_markdown(container: Tag) -> str:
 
 def scrape(url: str) -> ScrapeResult:
     """
-    Hoofd-scraper. Retourneert altijd een ScrapeResult (nooit een exception
-    naar de caller).
+    Waterval-scraper:
+      1. Directe fetch (roterende UA)
+      2. archive.ph fallback bij 403/429/verbindingsfout
 
-    Om over te schakelen naar Playwright (Fase 2):
-      - Vervang de aanroep van `_fetch_with_requests` door
-        `asyncio.run(_fetch_with_playwright(url))`
-      - De rest van deze functie blijft ongewijzigd.
+    Retourneert altijd een ScrapeResult — gooit nooit een exception.
     """
+    tried: list[str] = []
+
+    # ── Poging 1: directe fetch ──────────────────────────────────────────
+    tried.append("direct")
+    direct_error: Optional[str] = None
+    direct_code: Optional[int] = None
+
     try:
-        status_code, html = _fetch_with_requests(url)
+        status_code, html = _fetch_direct(url)
+        title, text = _parse_html(html)
+
+        if len(text) >= 100:
+            return ScrapeResult(
+                success=True, title=title, text=text,
+                url=url, source="direct", status_code=status_code, tried=tried,
+            )
+        # Gelukt qua HTTP maar te weinig tekst → toch archive proberen
+        direct_error = "Te weinig tekst via directe fetch, archive.ph wordt geprobeerd…"
+        direct_code = status_code
+
     except requests.exceptions.HTTPError as e:
-        code = e.response.status_code if e.response is not None else None
-        msg = {
-            403: "Toegang geweigerd (403 Forbidden). De server blokkeert de crawler.",
-            429: "Te veel verzoeken (429 Too Many Requests). Probeer het later opnieuw.",
-            401: "Authenticatie vereist (401). Dit artikel zit achter een harde paywall.",
-            404: "Pagina niet gevonden (404).",
-        }.get(code, f"HTTP-fout {code}: {e}")
-        logger.warning("HTTP-fout voor %s: %s", url, msg)
-        return ScrapeResult(success=False, title="", text="", url=url,
-                            error=msg, status_code=code)
+        direct_code = e.response.status_code if e.response is not None else None
+        if direct_code in (403, 429, 401):
+            direct_error = (
+                f"Directe fetch geblokkeerd ({direct_code}). "
+                "Archive.ph wordt geprobeerd…"
+            )
+        else:
+            direct_error = f"HTTP-fout {direct_code} bij directe fetch."
+        logger.warning("Directe fetch mislukt voor %s: %s", url, direct_error)
 
-    except requests.exceptions.ConnectionError:
-        return ScrapeResult(success=False, title="", text="", url=url,
-                            error="Kan geen verbinding maken met de server. Controleer de URL.")
-    except requests.exceptions.Timeout:
-        return ScrapeResult(success=False, title="", text="", url=url,
-                            error=f"Verzoek verlopen (timeout na {TIMEOUT}s).")
+    except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+        direct_error = f"Verbindingsfout bij directe fetch: {e}"
+        logger.warning(direct_error)
+
     except Exception as e:
-        logger.exception("Onverwachte scraper-fout voor %s", url)
-        return ScrapeResult(success=False, title="", text="", url=url,
-                            error=f"Onverwachte fout: {e}")
+        direct_error = f"Onverwachte fout bij directe fetch: {e}"
+        logger.exception(direct_error)
 
-    soup = BeautifulSoup(html, "html.parser")
-    title = _extract_title(soup)
-    _strip_noise(soup)
-    container = _find_article_container(soup)
+    # ── Poging 2: archive.ph fallback ────────────────────────────────────
+    tried.append("archive.ph")
+    time.sleep(1)  # kleine pauze voor beleefdheid
 
-    if not container:
-        return ScrapeResult(success=False, title=title, text="", url=url,
-                            error="Geen artikel-container gevonden in de DOM.",
-                            status_code=status_code)
+    try:
+        status_code, html = _fetch_archive(url)
+        title, text = _parse_html(html)
 
-    text = _to_markdown(container)
+        if len(text) >= 100:
+            return ScrapeResult(
+                success=True, title=title, text=text,
+                url=url, source="archive.ph", status_code=status_code, tried=tried,
+            )
 
-    if len(text) < 100:
+        # archive.ph gaf ook te weinig tekst
         return ScrapeResult(
             success=False, title=title, text=text, url=url,
+            source="archive.ph", status_code=status_code, tried=tried,
             error=(
-                "Te weinig tekst geëxtraheerd (mogelijk server-side paywall "
-                "of JavaScript-rendering vereist — overweeg Fase 2 met Playwright)."
+                "Archive.ph gevonden maar te weinig tekst geëxtraheerd. "
+                "Mogelijk is dit artikel nog niet gearchiveerd, of vereist het "
+                "JavaScript-rendering (overweeg Fase 2 met Playwright)."
             ),
-            status_code=status_code,
         )
 
-    return ScrapeResult(success=True, title=title, text=text, url=url,
-                        status_code=status_code)
+    except requests.exceptions.HTTPError as e:
+        code = e.response.status_code if e.response is not None else None
+        if code == 404:
+            archive_error = (
+                "Artikel niet gevonden in archive.ph (404). "
+                "Het is mogelijk nog nooit gearchiveerd."
+            )
+        else:
+            archive_error = f"Archive.ph gaf HTTP {code}."
+        logger.warning("Archive.ph mislukt voor %s: %s", url, archive_error)
+        return ScrapeResult(
+            success=False, title="", text="", url=url,
+            source="archive.ph", tried=tried,
+            error=f"{direct_error}\n\nArchive.ph fallback: {archive_error}",
+        )
+
+    except Exception as e:
+        logger.exception("Archive.ph fallback mislukt voor %s", url)
+        return ScrapeResult(
+            success=False, title="", text="", url=url,
+            source="archive.ph", tried=tried,
+            error=(
+                f"{direct_error}\n\n"
+                f"Archive.ph fallback ook mislukt: {e}\n\n"
+                "💡 Tip: probeer het artikel eerst handmatig op archive.ph te archiveren "
+                "via https://archive.ph"
+            ),
+        )
